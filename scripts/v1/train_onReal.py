@@ -241,6 +241,9 @@ class PL_XFeat_Real(pl.LightningModule):
                 detection_threshold=config.XFEAT['detection_threshold']
             )
         
+        # 将 net 切换回 train 模式（XFeat 初始化时强制 .eval()）
+        self.xfeat.net.train()
+        
         self.force_viz = False
         self.min_cossim = config.XFEAT['min_cossim']
 
@@ -259,58 +262,125 @@ class PL_XFeat_Real(pl.LightningModule):
             },
         }
 
+    def _train_extract_features(self, x, top_k):
+        """
+        训练专用特征提取：直接调用 self.xfeat.net 保留梯度计算图。
+        绕过 detectAndCompute 上的 @torch.inference_mode() 装饰器，
+        使 descriptors 具有 grad_fn，从而支持 loss.backward()。
+        """
+        x, rh, rw = self.xfeat.preprocess_tensor(x)   # resize to 32x multiple
+        B, _, _H, _W = x.shape
+
+        # 直接走 net.forward()，有梯度
+        M, K, H = self.xfeat.net(x)                   # M: [B,64,H/8,W/8], K: [B,65,...], H: [B,1,...]
+        M = torch.nn.functional.normalize(M, dim=1)   # L2-normalize feature maps
+
+        # 关键点热力图（不需要梯度，只用来定位）
+        with torch.no_grad():
+            K1h = self.xfeat.get_kpts_heatmap(K)
+            mkpts = self.xfeat.NMS(K1h, threshold=self.xfeat.detection_threshold, kernel_size=5)
+
+            # 插值可靠性分数
+            from modules.interpolator import InterpolateSparse2d
+            _nearest  = InterpolateSparse2d('nearest')
+            _bilinear = InterpolateSparse2d('bilinear')
+            scores = (_nearest(K1h, mkpts, _H, _W) * _bilinear(H, mkpts, _H, _W)).squeeze(-1)
+            scores[torch.all(mkpts == 0, dim=-1)] = -1
+
+            # Top-K 选点
+            idxs = torch.argsort(-scores)
+            mkpts_x = torch.gather(mkpts[..., 0], -1, idxs)[:, :top_k]
+            mkpts_y = torch.gather(mkpts[..., 1], -1, idxs)[:, :top_k]
+            mkpts   = torch.cat([mkpts_x[..., None], mkpts_y[..., None]], dim=-1)
+            scores  = torch.gather(scores, -1, idxs)[:, :top_k]
+            # 恢复原始坐标
+            mkpts = mkpts * torch.tensor([rw, rh], device=mkpts.device).view(1, 1, -1)
+
+        # 插值描述符（有梯度，因为 M 是直接从 net.forward() 来的）
+        feats = self.xfeat.interpolator(M, mkpts.detach(), H=_H, W=_W)  # [B, top_k, 64]
+        feats = torch.nn.functional.normalize(feats, dim=-1)
+
+        valid = scores > 0
+        return mkpts, scores, feats, valid
+
     def forward(self, batch):
-        """前向传播 - 使用 XFeat 提取特征和匹配"""
-        # 提取特征 - 训练时需要梯度
-        # 注意：XFeat 的 detectAndCompute 内部可能有 no_grad，需要确保梯度流通
-        feats0_list = self.xfeat.detectAndCompute(batch['image0'], top_k=self.config.XFEAT['top_k'])
-        feats1_list = self.xfeat.detectAndCompute(batch['image1'], top_k=self.config.XFEAT['top_k'])
-        
-        B = len(feats0_list)
-        
-        # 将 List[Dict] 转换为批量张量格式
-        max_kpts0 = max([len(f['keypoints']) for f in feats0_list])
-        max_kpts1 = max([len(f['keypoints']) for f in feats1_list])
-        
+        """前向传播 - 训练时直接调用 net 保留梯度，验证/推断时可用 detectAndCompute"""
+        top_k = self.config.XFEAT['top_k']
         device = batch['image0'].device
-        
-        # 初始化批量张量
-        keypoints0 = torch.zeros(B, max_kpts0, 2, device=device)
-        keypoints1 = torch.zeros(B, max_kpts1, 2, device=device)
-        descriptors0 = torch.zeros(B, max_kpts0, 64, device=device)
-        descriptors1 = torch.zeros(B, max_kpts1, 64, device=device)
-        scores0 = torch.zeros(B, max_kpts0, device=device)
-        scores1 = torch.zeros(B, max_kpts1, device=device)
-        
-        # 填充数据
-        for b in range(B):
-            n0 = len(feats0_list[b]['keypoints'])
-            n1 = len(feats1_list[b]['keypoints'])
-            keypoints0[b, :n0] = feats0_list[b]['keypoints']
-            keypoints1[b, :n1] = feats1_list[b]['keypoints']
-            descriptors0[b, :n0] = feats0_list[b]['descriptors']
-            descriptors1[b, :n1] = feats1_list[b]['descriptors']
-            scores0[b, :n0] = feats0_list[b]['scores']
-            scores1[b, :n1] = feats1_list[b]['scores']
-        
-        # 更新 batch
+        B = batch['image0'].shape[0]
+
+        if self.training:
+            # ---- 训练模式：有梯度的特征提取 ----
+            mkpts0, scores0, feats0, valid0 = self._train_extract_features(batch['image0'], top_k)
+            mkpts1, scores1, feats1, valid1 = self._train_extract_features(batch['image1'], top_k)
+
+            # 填充至统一长度
+            max_kpts0 = mkpts0.shape[1]
+            max_kpts1 = mkpts1.shape[1]
+            keypoints0   = mkpts0
+            keypoints1   = mkpts1
+            descriptors0 = feats0   # 保留梯度！
+            descriptors1 = feats1   # 保留梯度！
+            kp_scores0   = scores0
+            kp_scores1   = scores1
+        else:
+            # ---- 推断模式：使用原始 detectAndCompute（no_grad，效率高）----
+            with torch.no_grad():
+                feats0_list = self.xfeat.detectAndCompute(batch['image0'], top_k=top_k)
+                feats1_list = self.xfeat.detectAndCompute(batch['image1'], top_k=top_k)
+
+            max_kpts0 = max([len(f['keypoints']) for f in feats0_list])
+            max_kpts1 = max([len(f['keypoints']) for f in feats1_list])
+
+            keypoints0   = torch.zeros(B, max_kpts0, 2, device=device)
+            keypoints1   = torch.zeros(B, max_kpts1, 2, device=device)
+            descriptors0 = torch.zeros(B, max_kpts0, 64, device=device)
+            descriptors1 = torch.zeros(B, max_kpts1, 64, device=device)
+            kp_scores0   = torch.zeros(B, max_kpts0, device=device)
+            kp_scores1   = torch.zeros(B, max_kpts1, device=device)
+
+            for b in range(B):
+                n0 = len(feats0_list[b]['keypoints'])
+                n1 = len(feats1_list[b]['keypoints'])
+                keypoints0[b, :n0]   = feats0_list[b]['keypoints']
+                keypoints1[b, :n1]   = feats1_list[b]['keypoints']
+                descriptors0[b, :n0] = feats0_list[b]['descriptors']
+                descriptors1[b, :n1] = feats1_list[b]['descriptors']
+                kp_scores0[b, :n0]   = feats0_list[b]['scores']
+                kp_scores1[b, :n1]   = feats1_list[b]['scores']
+
+        # 更新 batch（供 loss 和 validation 使用）
         batch.update({
             'keypoints0': keypoints0,
             'keypoints1': keypoints1,
             'descriptors0': descriptors0,
             'descriptors1': descriptors1,
-            'keypoint_scores0': scores0,
-            'keypoint_scores1': scores1,
+            'keypoint_scores0': kp_scores0,
+            'keypoint_scores1': kp_scores1,
         })
-        
-        # 使用 XFeat 的 MNN 匹配器进行匹配
-        matches_list = self.xfeat.batch_match(descriptors0, descriptors1, min_cossim=self.min_cossim)
-        
-        # 将匹配结果转换为 matches0 格式 [B, M]，-1 表示无匹配
+
+        # MNN 匹配（training 时用带梯度的 descriptors 做 match，推断时同理）
+        # 注意：batch_match 也有 @inference_mode，用手动实现替代
+        desc0_norm = torch.nn.functional.normalize(descriptors0.detach(), dim=-1)
+        desc1_norm = torch.nn.functional.normalize(descriptors1.detach(), dim=-1)
+        with torch.no_grad():
+            cossim_mat = torch.bmm(desc0_norm, desc1_norm.transpose(1, 2))  # [B, M, N]
+            match12 = torch.argmax(cossim_mat, dim=-1)       # [B, M]
+            match21 = torch.argmax(cossim_mat.permute(0,2,1), dim=-1)  # [B, N]
+            idx0_base = torch.arange(match12.shape[1], device=device)
+
+        max_kpts0 = descriptors0.shape[1]
         matches0 = torch.full((B, max_kpts0), -1, dtype=torch.long, device=device)
-        for b, (idx0, idx1) in enumerate(matches_list):
-            matches0[b, idx0] = idx1
-        
+        for b in range(B):
+            mutual = match21[b][match12[b]] == idx0_base
+            if self.min_cossim > 0:
+                cossim_max = cossim_mat[b].max(dim=1).values
+                good = cossim_max > self.min_cossim
+                sel = mutual & good
+            else:
+                sel = mutual
+            matches0[b, sel] = match12[b][sel]
+
         return {
             'matches0': matches0,
             'keypoints0': keypoints0,
@@ -367,8 +437,8 @@ class PL_XFeat_Real(pl.LightningModule):
         # 计算余弦相似度矩阵
         cossim = torch.bmm(desc0_norm, desc1_norm.transpose(1, 2))  # [B, M, N]
         
-        loss = torch.tensor(0.0, device=device)
-        valid_count = 0
+        # 用列表累积各匹配对的损失，避免 in-place += 破坏计算图
+        loss_terms = []
         
         for b in range(B):
             valid_b = valid_mask[b]
@@ -381,17 +451,18 @@ class PL_XFeat_Real(pl.LightningModule):
                 gt_match = matches_gt_b[idx]
                 
                 if gt_match >= 0:  # 有GT匹配
-                    # 正样本损失：最大化与GT匹配点的相似度
-                    # 使用交叉熵损失，将相似度转换为logits
-                    logits = cossim[b, idx, :]  # [N]
-                    target = gt_match
-                    
-                    # 交叉熵损失
-                    loss += torch.nn.functional.cross_entropy(logits.unsqueeze(0), target.unsqueeze(0))
-                    valid_count += 1
+                    # 交叉熵损失：最大化与GT匹配点的描述符相似度
+                    logits = cossim[b, idx, :]           # [N]，有梯度
+                    target = gt_match.unsqueeze(0)       # [1]
+                    loss_terms.append(
+                        torch.nn.functional.cross_entropy(logits.unsqueeze(0), target)
+                    )
         
-        if valid_count > 0:
-            loss = loss / valid_count
+        if loss_terms:
+            loss = torch.stack(loss_terms).mean()
+        else:
+            # 没有有效的 GT 匹配对时返回零损失（仍有 grad_fn 防止 backward 报错）
+            loss = (descriptors0 * 0).sum()
         
         return loss
 

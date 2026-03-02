@@ -137,6 +137,120 @@ def create_chessboard(img1, img2, grid_size=4):
     return chessboard
 
 # ==========================================
+# 共享指标计算函数（可被 train 脚本导入）
+# ==========================================
+def compute_auc_rop(s_error):
+    """
+    计算 mAUC (mean Area Under Curve)
+    基于 mean_auc.md 中描述的算法：
+    对每个整数像素阈值 [1, 25]，计算误差小于阈值的样本比例
+    mAUC = 累加比例 / (25 * 100)，范围 [0, 1]
+    """
+    s_error = np.array(s_error)
+    if len(s_error) == 0:
+        return 0.0
+    limit = 25
+    accum_s = 0
+    for i in range(1, limit + 1):
+        accum_s += np.sum(s_error < i) * 100 / len(s_error)
+    return accum_s / (limit * 100)
+
+def compute_batch_registration_metrics(batch, H_ests):
+    """
+    计算一个 batch 内每个样本的配准指标（共享函数，可被 train 脚本导入）。
+    
+    Returns:
+        list of dicts, 每个 dict 包含:
+            - mse, rmse, mace: float or None (匹配失败时为 None)
+            - match_success: bool
+            - corner_error: float (匹配失败时为 1e6)
+    """
+    batch_size = batch['image0'].shape[0]
+    Ts_gt = batch['T_0to1'].cpu().numpy()
+    results = []
+    
+    for i in range(batch_size):
+        H_est = H_ests[i]
+        
+        # 判断匹配是否成功
+        originally_identity = np.allclose(H_est, np.eye(3), atol=1e-6)
+        valid_H = is_valid_homography(H_est)
+        match_success = (not originally_identity) and valid_H
+        
+        if not valid_H:
+            H_est = np.eye(3)
+        
+        img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+        img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+        img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+        
+        h, w = img0.shape
+        
+        if match_success:
+            mace = compute_corner_error(H_est, Ts_gt[i], h, w)
+            try:
+                H_inv = np.linalg.inv(H_est)
+                img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
+            except:
+                img1_result = img1.copy()
+            try:
+                res_f, orig_f = filter_valid_area(img1_result, img1_gt)
+                mask = (res_f > 0)
+                mse = np.mean((res_f[mask].astype(np.float64) - orig_f[mask].astype(np.float64))**2) if np.any(mask) else 0.0
+                rmse = np.sqrt(mse)
+            except:
+                mse = 0.0
+                rmse = 0.0
+            results.append({'mse': mse, 'rmse': rmse, 'mace': mace,
+                            'match_success': True, 'corner_error': mace})
+        else:
+            results.append({'mse': None, 'rmse': None, 'mace': None,
+                            'match_success': False, 'corner_error': 1e6})
+    
+    return results
+
+def aggregate_epoch_metrics(sample_metrics, epoch_t_errs):
+    """
+    聚合所有样本的指标，计算 epoch 级别的汇总（共享函数，可被 train 脚本导入）。
+    """
+    from scripts.v1.metrics import error_auc
+    
+    total = len(sample_metrics)
+    matched = [m for m in sample_metrics if m['match_success']]
+    matched_count = len(matched)
+    failed_count = total - matched_count
+    failure_rate = failed_count / total if total > 0 else 0.0
+    
+    # MSE/RMSE/MACE 只在匹配成功的样本上计算
+    avg_mse = float(np.mean([m['mse'] for m in matched])) if matched else 0.0
+    avg_rmse = float(np.mean([m['rmse'] for m in matched])) if matched else 0.0
+    avg_mace = float(np.mean([m['mace'] for m in matched])) if matched else float('inf')
+    
+    # mAUC 在所有样本上计算（匹配失败的样本 corner_error = 1e6）
+    corner_errors = [m['corner_error'] for m in sample_metrics]
+    mauc = compute_auc_rop(corner_errors) if corner_errors else 0.0
+    
+    # AUC from t_errs
+    if len(epoch_t_errs) > 0:
+        auc_dict = error_auc(epoch_t_errs, [5, 10, 20])
+    else:
+        auc_dict = {'auc@5': 0.0, 'auc@10': 0.0, 'auc@20': 0.0}
+    
+    auc5 = auc_dict.get('auc@5', 0.0)
+    auc10 = auc_dict.get('auc@10', 0.0)
+    auc20 = auc_dict.get('auc@20', 0.0)
+    combined_auc = (auc5 + auc10 + auc20) / 3.0
+    inverse_mace = 1.0 / (1.0 + avg_mace)
+    
+    return {
+        'mse': avg_mse, 'rmse': avg_rmse, 'mace': avg_mace,
+        'mauc': mauc, 'failure_rate': failure_rate,
+        'matched_count': matched_count, 'failed_count': failed_count, 'total_count': total,
+        'auc@5': auc5, 'auc@10': auc10, 'auc@20': auc20,
+        'combined_auc': combined_auc, 'inverse_mace': inverse_mace,
+    }
+
+# ==========================================
 # 辅助类: RealDatasetWrapper (格式转换，与 train_onPureGen_v2.py 一致)
 # ==========================================
 class RealDatasetWrapper(torch.utils.data.Dataset):
