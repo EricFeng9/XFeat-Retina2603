@@ -261,10 +261,10 @@ class PL_XFeat_Real(pl.LightningModule):
 
     def forward(self, batch):
         """前向传播 - 使用 XFeat 提取特征和匹配"""
-        # 提取特征
-        with torch.no_grad() if not self.training else torch.enable_grad():
-            feats0_list = self.xfeat.detectAndCompute(batch['image0'], top_k=self.config.XFEAT['top_k'])
-            feats1_list = self.xfeat.detectAndCompute(batch['image1'], top_k=self.config.XFEAT['top_k'])
+        # 提取特征 - 训练时需要梯度
+        # 注意：XFeat 的 detectAndCompute 内部可能有 no_grad，需要确保梯度流通
+        feats0_list = self.xfeat.detectAndCompute(batch['image0'], top_k=self.config.XFEAT['top_k'])
+        feats1_list = self.xfeat.detectAndCompute(batch['image1'], top_k=self.config.XFEAT['top_k'])
         
         B = len(feats0_list)
         
