@@ -48,6 +48,14 @@ from scripts.v1.metrics import (
     set_metrics_verbose
 )
 
+# 导入渐进式域随机化增强模块
+from scripts.v1.gen_data_enhance_progressive import (
+    apply_progressive_augmentation,
+    set_augmentation_epoch,
+    get_current_augmentation_strength,
+    get_strength_probabilities
+)
+
 # ==========================================
 # 配置函数
 # ==========================================
@@ -623,6 +631,10 @@ class PL_XFeat_Gen(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """训练步骤（生成数据训练）"""
+        # 【渐进式域随机化增强】增强强度随训练进度自动调整
+        batch['image0'] = apply_progressive_augmentation(batch['image0'])
+        batch['image1'] = apply_progressive_augmentation(batch['image1'])
+
         outputs = self(batch)
 
         # 获取血管掩码（如果存在）
@@ -632,6 +644,7 @@ class PL_XFeat_Gen(pl.LightningModule):
 
         self.log('train/loss', loss.detach(), on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/vessel_weight', self.vessel_loss_weight, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/aug_strength', get_current_augmentation_strength(), on_step=False, on_epoch=True, prog_bar=False)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -1060,6 +1073,13 @@ class CurriculumScheduler(Callback):
     
     def on_train_epoch_start(self, trainer, pl_module):
         epoch = trainer.current_epoch
+
+        # 同步域随机化的 epoch（让增强强度随训练进度增长）
+        set_augmentation_epoch(epoch)
+        avg_strength = get_current_augmentation_strength()
+        light_prob, medium_prob, heavy_prob = get_strength_probabilities()
+        logger.info(f"Epoch {epoch}: 域随机化 - 平均强度={avg_strength:.3f}, "
+                    f"采样概率[轻/中/强]=({light_prob:.0%}/{medium_prob:.0%}/{heavy_prob:.0%})")
 
         if epoch < self.teaching_end:
             current_weight = self.max_weight
