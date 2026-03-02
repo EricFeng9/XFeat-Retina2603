@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 # 导入 XFeat 相关模块
 from modules.xfeat import XFeat
+from modules.interpolator import InterpolateSparse2d
+import torch.nn.functional as F
 
 # 导入数据集
 from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset as CFFADataset_Filtered
@@ -246,6 +248,10 @@ class PL_XFeat_Real(pl.LightningModule):
         
         self.force_viz = False
         self.min_cossim = config.XFEAT['min_cossim']
+        
+        # 预实例化 interpolators，避免每次 forward 都重建
+        self._interp_nearest  = InterpolateSparse2d('nearest')
+        self._interp_bilinear = InterpolateSparse2d('bilinear')
 
     def configure_optimizers(self):
         lr = self.config.TRAINER.TRUE_LR
@@ -280,11 +286,9 @@ class PL_XFeat_Real(pl.LightningModule):
             K1h = self.xfeat.get_kpts_heatmap(K)
             mkpts = self.xfeat.NMS(K1h, threshold=self.xfeat.detection_threshold, kernel_size=5)
 
-            # 插值可靠性分数
-            from modules.interpolator import InterpolateSparse2d
-            _nearest  = InterpolateSparse2d('nearest')
-            _bilinear = InterpolateSparse2d('bilinear')
-            scores = (_nearest(K1h, mkpts, _H, _W) * _bilinear(H, mkpts, _H, _W)).squeeze(-1)
+            # 插值可靠性分数（用预实例化的 interpolators）
+            scores = (self._interp_nearest(K1h, mkpts, _H, _W)
+                      * self._interp_bilinear(H, mkpts, _H, _W)).squeeze(-1)
             scores[torch.all(mkpts == 0, dim=-1)] = -1
 
             # Top-K 选点
@@ -408,62 +412,36 @@ class PL_XFeat_Real(pl.LightningModule):
 
 
     def _compute_loss(self, outputs, batch):
-        """计算损失（基于匹配对的监督学习）"""
-        kpts0 = batch['keypoints0']
-        kpts1 = batch['keypoints1']
-        T_0to1 = batch['T_0to1']
-        
-        # 计算点匹配的 GT
-        matches_gt = self._compute_gt_matches(kpts0, kpts1, T_0to1)
-        
-        # 获取预测的匹配
-        matches_pred = outputs['matches0']  # [B, M]
-        
-        # 计算匹配损失
-        B, M = matches_pred.shape
-        device = kpts0.device
-        
-        descriptors0 = batch['descriptors0']  # [B, M, 64]
-        descriptors1 = batch['descriptors1']  # [B, N, 64]
-        
-        # 过滤有效的关键点（分数>0）
-        valid_mask = batch['keypoint_scores0'] > 0
-        
-        # 计算所有可能的余弦相似度 [B, M, N]
-        # 归一化描述符
-        desc0_norm = torch.nn.functional.normalize(descriptors0, dim=-1)
-        desc1_norm = torch.nn.functional.normalize(descriptors1, dim=-1)
-        
-        # 计算余弦相似度矩阵
+        """计算损失 —— 完全向量化，无 Python for 循环，单次 cross_entropy 调用"""
+        kpts0    = batch['keypoints0']
+        kpts1    = batch['keypoints1']
+        T_0to1   = batch['T_0to1']
+        desc0    = batch['descriptors0']   # [B, M, 64]
+        desc1    = batch['descriptors1']   # [B, N, 64]
+        valid_kp = batch['keypoint_scores0'] > 0  # [B, M]
+
+        # ① GT 匹配（no_grad，仅用于监督标签生成）
+        with torch.no_grad():
+            matches_gt = self._compute_gt_matches(kpts0.detach(), kpts1.detach(), T_0to1)
+            # 有效 mask：关键点本身有效 AND 存在 GT 匹配
+            gt_match_mask = (matches_gt >= 0) & valid_kp   # [B, M]
+
+        if not gt_match_mask.any():
+            # 无有效匹配对时返回有梯度的零损失
+            return (desc0 * 0).sum()
+
+        # ② 归一化描述符并计算相似度矩阵 [B, M, N]
+        desc0_norm = F.normalize(desc0, dim=-1)
+        desc1_norm = F.normalize(desc1, dim=-1)
         cossim = torch.bmm(desc0_norm, desc1_norm.transpose(1, 2))  # [B, M, N]
-        
-        # 用列表累积各匹配对的损失，避免 in-place += 破坏计算图
-        loss_terms = []
-        
-        for b in range(B):
-            valid_b = valid_mask[b]
-            matches_gt_b = matches_gt[b]
-            
-            # 只考虑有效的关键点
-            valid_indices = torch.where(valid_b)[0]
-            
-            for idx in valid_indices:
-                gt_match = matches_gt_b[idx]
-                
-                if gt_match >= 0:  # 有GT匹配
-                    # 交叉熵损失：最大化与GT匹配点的描述符相似度
-                    logits = cossim[b, idx, :]           # [N]，有梯度
-                    target = gt_match.unsqueeze(0)       # [1]
-                    loss_terms.append(
-                        torch.nn.functional.cross_entropy(logits.unsqueeze(0), target)
-                    )
-        
-        if loss_terms:
-            loss = torch.stack(loss_terms).mean()
-        else:
-            # 没有有效的 GT 匹配对时返回零损失（仍有 grad_fn 防止 backward 报错）
-            loss = (descriptors0 * 0).sum()
-        
+
+        # ③ 一次性取出所有有效样本的 logits 和 targets（无 Python 循环）
+        b_idx, m_idx = torch.where(gt_match_mask)        # [K], [K]
+        targets = matches_gt[b_idx, m_idx]               # [K]  目标列索引
+        logits  = cossim[b_idx, m_idx, :]                # [K, N]  整行 logits
+
+        # ④ 一次 cross_entropy 完成所有样本
+        loss = F.cross_entropy(logits, targets)
         return loss
 
     def training_step(self, batch, batch_idx):
