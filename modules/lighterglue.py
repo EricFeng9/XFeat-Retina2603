@@ -21,7 +21,7 @@ class LighterGlue(nn.Module):
     "flash": True,  # enable FlashAttention if available.
     "mp": False,  # enable mixed precision
     "depth_confidence": -1,  # early stopping, disable with -1
-    "width_confidence": 0.95,  # point pruning, disable with -1
+    "width_confidence": -1,   # point pruning 关闭：kornia 在 batch>1 时 ind0 索引有 bug，会 IndexError
     "filter_threshold": 0.1,  # match threshold
     "weights": None,
     }
@@ -48,10 +48,27 @@ class LighterGlue(nn.Module):
         self.net.load_state_dict(state_dict, strict=False)
         self.net.to(self.dev)
 
-    @torch.inference_mode()
-    def forward(self, data, min_conf = 0.1):
+    def _run_net(self, data, min_conf=0.1):
+        """内部调用：构建 kornia 格式并执行匹配（可用于推理或训练）"""
         self.net.conf.filter_threshold = min_conf
-        result = self.net( {   'image0': {'keypoints': data['keypoints0'], 'descriptors': data['descriptors0'], 'image_size': data['image_size0']},
-                               'image1': {'keypoints': data['keypoints1'], 'descriptors': data['descriptors1'], 'image_size': data['image_size1']}  
-                           } )
-        return result
+        return self.net({
+            'image0': {
+                'keypoints': data['keypoints0'],
+                'descriptors': data['descriptors0'],
+                'image_size': data['image_size0'],
+            },
+            'image1': {
+                'keypoints': data['keypoints1'],
+                'descriptors': data['descriptors1'],
+                'image_size': data['image_size1'],
+            },
+        })
+
+    @torch.inference_mode()
+    def forward(self, data, min_conf=0.1):
+        """推理接口"""
+        return self._run_net(data, min_conf=min_conf)
+
+    def forward_train(self, data, min_conf=0.1):
+        """训练接口：不启用 inference_mode，便于反向传播更新匹配器参数"""
+        return self._run_net(data, min_conf=min_conf)
